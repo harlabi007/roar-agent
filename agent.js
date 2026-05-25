@@ -74,7 +74,7 @@ function makeMatchId(home, away) {
 function shouldCreateMarket(matchId) {
   const last = recentlyCreated.get(matchId);
   if (!last) return true;
-  return Date.now() - last > 20 * 60 * 1000;
+  return Date.now() - last > 30 * 60 * 1000;
 }
 
 // ─── SYNC FROM CHAIN ON STARTUP ───────────────────────────────────────────────
@@ -87,7 +87,7 @@ async function syncRecentlyCreatedFromChain() {
     let synced     = 0;
     for (const m of markets) {
       const closesAtMs = Number(m.closesAt) * 1000;
-      if (closesAtMs > now - 20 * 60 * 1000) {
+      if (closesAtMs > now - 30 * 60 * 1000) {
         recentlyCreated.set(m.matchId, closesAtMs - 15 * 60 * 1000);
         synced++;
       }
@@ -141,10 +141,9 @@ async function fetchRecentMatchesRapidAPI() {
     if (!res.ok) return null;
     const data = await res.json();
     const now  = Date.now();
-    // Only matches that finished within the last 3 hours
     const matches = (data.response || []).filter(f => {
       if (!TARGET_LEAGUE_IDS.has(f.league.id)) return false;
-      const endTime = new Date(f.fixture.date).getTime() + 105 * 60 * 1000; // approx end time
+      const endTime = new Date(f.fixture.date).getTime() + 105 * 60 * 1000;
       return now - endTime < 3 * 60 * 60 * 1000;
     });
     if (matches.length > 0) {
@@ -196,7 +195,6 @@ async function fetchRecentMatchesFootballData() {
     const now  = Date.now();
     const matches = (data.matches || []).filter(m => {
       if (!TARGET_COMPETITION_CODES.has(m.competition.code)) return false;
-      // Only if finished within last 3 hours
       const matchTime = new Date(m.utcDate).getTime();
       return now - matchTime < 3 * 60 * 60 * 1000 + 105 * 60 * 1000;
     });
@@ -220,7 +218,7 @@ function normalizeRapidAPIMatch(f, type) {
     flag:   getLeagueFlag(f.league.id),
     score:  `${f.goals.home ?? 0}-${f.goals.away ?? 0}`,
     minute: f.fixture.status.elapsed || null,
-    type,   // "live" or "recent"
+    type,
   };
 }
 
@@ -266,7 +264,6 @@ async function createMarketForMatch(match) {
     const contract   = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
     const questionFn = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
     const question   = questionFn(match.home, match.away);
-    // Live matches: 15 min markets. Recent/completed: 10 min markets (post-match questions)
     const duration   = match.type === "live" ? 900 : 600;
 
     const typeLabel = match.type === "live" ? "🔴 LIVE" : "🕐 RECENT";
@@ -331,13 +328,11 @@ function resolveMarketOutcome(market) {
 async function createMarkets() {
   console.log("\n🤖 Fetching live match data...");
 
-  // ── STEP 1: Try live matches from both APIs ──────────────────────────────
   const [rapidLive, fdLive] = await Promise.all([
     fetchLiveMatchesRapidAPI(),
     fetchLiveMatchesFootballData(),
   ]);
 
-  // Merge live matches from both APIs, deduplicate by team names
   let liveMatches = [];
   if (rapidLive) {
     liveMatches = [...liveMatches, ...rapidLive.matches.map(f => normalizeRapidAPIMatch(f, "live"))];
@@ -361,7 +356,6 @@ async function createMarkets() {
     return;
   }
 
-  // ── STEP 2: No live matches — try recently completed matches ─────────────
   console.log("   No live matches right now. Checking recently completed matches...");
 
   const [rapidRecent, fdRecent] = await Promise.all([
@@ -392,22 +386,21 @@ async function createMarkets() {
     return;
   }
 
-  // ── STEP 3: Nothing available — wait for next poll. NO demo fallback. ────
   console.log("⏳ No live or recent matches available in target leagues right now.");
-  console.log("   Will check again in 5 minutes. No demo data will be used.");
+  console.log("   Will check again in 30 minutes. No demo data will be used.");
 }
 
 // ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 async function run() {
-  console.log("🦁 ROAR AI Agent v6.0 starting...");
+  console.log("🦁 ROAR AI Agent v6.1 starting...");
   console.log(`📍 Contract: ${CONTRACT_ADDRESS}`);
   console.log(`🌐 Target leagues: Premier League, La Liga, Bundesliga, Serie A, Ligue 1, Champions League, Europa League, World Cup`);
-  console.log(`⏱  Polling every 5 minutes — REAL matches only, no demo data\n`);
+  console.log(`⏱  Polling every 30 minutes — REAL matches only, no demo data\n`);
 
   if (!RAPID_API_KEY && !FOOTBALL_API_KEY) {
     console.error("❌ FATAL: No API keys set. Set RAPID_API_KEY or FOOTBALL_API_KEY in .env");
     console.error("   The agent cannot run without at least one API key.");
-    process.exit(1); // Stop the agent — don't run with no data source
+    process.exit(1);
   }
 
   await syncRecentlyCreatedFromChain();
@@ -418,7 +411,7 @@ async function run() {
     console.log("\n⏰ Scheduled update — " + new Date().toLocaleTimeString());
     await settleExpiredMarkets();
     await createMarkets();
-  }, 5 * 60 * 1000);
+  }, 30 * 60 * 1000);
 }
 
 run();
