@@ -4,14 +4,15 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node agent.js & node proxy.js",
-  "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "concurrently \"node agent.js\" \"node proxy.js\"",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "concurrently": "^8.2.2",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "ethers": "^6.16.0",
