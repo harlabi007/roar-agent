@@ -262,7 +262,7 @@ async function run(){
   console.log(`⛽  Gas: auto-estimated`);
   console.log(`⏱  Polling every 2 minutes`);
   console.log(`📡 APIs: TheSportsDB (free) + football-data.org`);
-  console.log(`🎮 Fallback: ${MIN_OPEN_MARKETS} demo markets always open\n`);
+  console.log(`🎮 No demo markets — real live matches only\n`);
 
   await settleExpiredMarkets();
   await createMarkets();
