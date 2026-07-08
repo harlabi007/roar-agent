@@ -99,16 +99,73 @@ async function settleExpiredMarkets(){
 }
 
 // ─── CREATE A MARKET ──────────────────────────────────────────────────────────
+// ─── POLYMARKET API — free, no key needed ────────────────────────────────────
+async function fetchPolymarketSportsQuestions(){
+  try {
+    const res = await fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100', {
+      headers: { 'User-Agent': 'ROAR-Agent/1.0' }
+    });
+    if(!res.ok){ console.log('   Polymarket API error:', res.status); return []; }
+    const markets = await res.json();
+    const all = Array.isArray(markets) ? markets : (markets.markets || []);
+    const football = all.filter(m => {
+      const q = (m.question || m.title || '').toLowerCase();
+      return q.includes('goal') || q.includes('score') || q.includes('win') ||
+             q.includes('match') || q.includes('soccer') || q.includes('football') ||
+             q.includes('premier league') || q.includes('world cup') ||
+             q.includes('champions league') || q.includes('la liga') ||
+             q.includes('bundesliga') || q.includes('serie a');
+    });
+    console.log(`   Polymarket football questions found: ${football.length}`);
+    return football.map(m => ({
+      question: m.question || m.title,
+      yesPrice: (() => { try{ return parseFloat(JSON.parse(m.outcomePrices||'[0.5]')[0]); }catch(e){ return 0.5; } })(),
+    })).filter(m => m.question);
+  } catch(e) { console.log('   Polymarket error:', e.message); return []; }
+}
+
+// Cache Polymarket questions so we don't fetch every time
+let polymarketQuestionsCache = [];
+let lastPolymarketFetch = 0;
+
+async function getPolymarketQuestions(){
+  // Refresh cache every 30 minutes
+  if(Date.now() - lastPolymarketFetch > 30*60*1000 || polymarketQuestionsCache.length === 0){
+    polymarketQuestionsCache = await fetchPolymarketSportsQuestions();
+    lastPolymarketFetch = Date.now();
+  }
+  return polymarketQuestionsCache;
+}
+
 async function createMarketForMatch(match, durationSeconds){
   try {
     const { signer, provider } = await getSigner();
-    const contract   = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
-    const matchId    = makeMatchId(match.home, match.away);
-    const questionFn = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
-    const question   = questionFn(match.home, match.away);
-    const duration   = durationSeconds || 900;
-    const gas        = await getGasOverrides(provider);
-    const typeLabel  = match.type === "demo" ? "🎮 DEMO" : match.type === "live" ? "🔴 LIVE" : "🕐 RECENT";
+    const contract  = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+    const matchId   = makeMatchId(match.home, match.away);
+    const duration  = durationSeconds || 900;
+    const gas       = await getGasOverrides(provider);
+    const typeLabel = match.type === "demo" ? "🎮 DEMO" : match.type === "live" ? "🔴 LIVE" : "🕐 RECENT";
+
+    // Try to get a relevant question from Polymarket first
+    let question = null;
+    const polyQuestions = await getPolymarketQuestions();
+    const relevant = polyQuestions.filter(q => {
+      const ql = q.question.toLowerCase();
+      return ql.includes(match.home.toLowerCase()) ||
+             ql.includes(match.away.toLowerCase()) ||
+             ql.includes(match.comp.toLowerCase().split(' ')[0]);
+    });
+
+    if(relevant.length > 0){
+      // Use a real Polymarket question
+      const pick = relevant[Math.floor(Math.random() * relevant.length)];
+      question = pick.question;
+      console.log(`🎯 Using Polymarket question (YES: ${Math.round(pick.yesPrice*100)}%)`);
+    } else {
+      // Fall back to our template questions
+      const questionFn = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
+      question = questionFn(match.home, match.away);
+    }
 
     console.log(`\n${match.flag} [${typeLabel}] ${match.comp}: ${match.home} vs ${match.away}`);
     console.log(`❓ "${question}"`);
