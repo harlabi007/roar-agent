@@ -167,6 +167,14 @@ async function createMarketForMatch(match, durationSeconds){
       question = questionFn(match.home, match.away);
     }
 
+    // Check if market for this matchId already exists and is open
+    const openMarkets = await getOpenMarketsFromChain();
+    const alreadyExists = openMarkets.find(m => m.matchId === matchId);
+    if(alreadyExists){
+      console.log(`⏭  Skipping ${matchId} — market already open on chain`);
+      return true;
+    }
+
     console.log(`\n${match.flag} [${typeLabel}] ${match.comp}: ${match.home} vs ${match.away}`);
     console.log(`❓ "${question}"`);
 
