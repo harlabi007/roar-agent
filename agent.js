@@ -8,7 +8,7 @@ const ABI = [
   "function getAllMarkets() view returns (tuple(uint256 id, string question, string matchId, uint256 closesAt, uint256 totalYes, uint256 totalNo, uint8 outcome, bool settled)[])",
 ];
 
-// Demo markets removed — real matches only
+const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY || "";
 
 const QUESTIONS = [
   (h,a)=>`Will ${h} score in the next 15 minutes?`,
@@ -24,8 +24,6 @@ const QUESTIONS = [
 ];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-
 const POLL_MS = 2 * 60 * 1000;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -52,9 +50,28 @@ async function getGasOverrides(provider){
     const minGas   = ethers.parseUnits("2", "gwei");
     const netGas   = feeData.gasPrice || minGas;
     const gasPrice = netGas > minGas ? netGas * 120n / 100n : minGas;
-    return { gasPrice };
+    return { gasPrice, gasLimit: 500000n };
   } catch(e) {
-    return { gasPrice: ethers.parseUnits("2", "gwei") };
+    return { gasPrice: ethers.parseUnits("2", "gwei"), gasLimit: 500000n };
+  }
+}
+
+// ─── CHECK WALLET BALANCE ─────────────────────────────────────────────────────
+async function checkWalletBalance(){
+  try {
+    const { signer, provider } = await getSigner();
+    const balance = await provider.getBalance(signer.address);
+    const balanceEth = parseFloat(ethers.formatEther(balance));
+    console.log(`💰 Agent wallet: ${signer.address}`);
+    console.log(`💰 Balance: ${balanceEth.toFixed(4)} OKB`);
+    if(balanceEth < 0.01){
+      console.error(`❌ CRITICAL: Wallet balance too low! Get testnet OKB from faucet: https://www.okx.com/xlayer/faucet`);
+      return false;
+    }
+    return true;
+  } catch(e) {
+    console.error("❌ Could not check balance:", e.message);
+    return false;
   }
 }
 
@@ -98,45 +115,7 @@ async function settleExpiredMarkets(){
   } catch(e){ console.error("❌ Error settling:", e.message); }
 }
 
-// ─── CREATE A MARKET ──────────────────────────────────────────────────────────
-// ─── POLYMARKET API — free, no key needed ────────────────────────────────────
-async function fetchPolymarketSportsQuestions(){
-  try {
-    const res = await fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100', {
-      headers: { 'User-Agent': 'ROAR-Agent/1.0' }
-    });
-    if(!res.ok){ console.log('   Polymarket API error:', res.status); return []; }
-    const markets = await res.json();
-    const all = Array.isArray(markets) ? markets : (markets.markets || []);
-    const football = all.filter(m => {
-      const q = (m.question || m.title || '').toLowerCase();
-      return q.includes('goal') || q.includes('score') || q.includes('win') ||
-             q.includes('match') || q.includes('soccer') || q.includes('football') ||
-             q.includes('premier league') || q.includes('world cup') ||
-             q.includes('champions league') || q.includes('la liga') ||
-             q.includes('bundesliga') || q.includes('serie a');
-    });
-    console.log(`   Polymarket football questions found: ${football.length}`);
-    return football.map(m => ({
-      question: m.question || m.title,
-      yesPrice: (() => { try{ return parseFloat(JSON.parse(m.outcomePrices||'[0.5]')[0]); }catch(e){ return 0.5; } })(),
-    })).filter(m => m.question);
-  } catch(e) { console.log('   Polymarket error:', e.message); return []; }
-}
-
-// Cache Polymarket questions so we don't fetch every time
-let polymarketQuestionsCache = [];
-let lastPolymarketFetch = 0;
-
-async function getPolymarketQuestions(){
-  // Refresh cache every 30 minutes
-  if(Date.now() - lastPolymarketFetch > 30*60*1000 || polymarketQuestionsCache.length === 0){
-    polymarketQuestionsCache = await fetchPolymarketSportsQuestions();
-    lastPolymarketFetch = Date.now();
-  }
-  return polymarketQuestionsCache;
-}
-
+// ─── CREATE MARKET ────────────────────────────────────────────────────────────
 async function createMarketForMatch(match, durationSeconds){
   try {
     const { signer, provider } = await getSigner();
@@ -144,36 +123,19 @@ async function createMarketForMatch(match, durationSeconds){
     const matchId   = makeMatchId(match.home, match.away);
     const duration  = durationSeconds || 900;
     const gas       = await getGasOverrides(provider);
-    const typeLabel = match.type === "demo" ? "🎮 DEMO" : match.type === "live" ? "🔴 LIVE" : "🕐 RECENT";
+    const typeLabel = match.type === "live" ? "🔴 LIVE" : "🕐 UPCOMING";
 
-    // Try to get a relevant question from Polymarket first
-    let question = null;
-    const polyQuestions = await getPolymarketQuestions();
-    const relevant = polyQuestions.filter(q => {
-      const ql = q.question.toLowerCase();
-      return ql.includes(match.home.toLowerCase()) ||
-             ql.includes(match.away.toLowerCase()) ||
-             ql.includes(match.comp.toLowerCase().split(' ')[0]);
-    });
-
-    if(relevant.length > 0){
-      // Use a real Polymarket question
-      const pick = relevant[Math.floor(Math.random() * relevant.length)];
-      question = pick.question;
-      console.log(`🎯 Using Polymarket question (YES: ${Math.round(pick.yesPrice*100)}%)`);
-    } else {
-      // Fall back to our template questions
-      const questionFn = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
-      question = questionFn(match.home, match.away);
-    }
-
-    // Check if market for this matchId already exists and is open
-    const openMarkets = await getOpenMarketsFromChain();
-    const alreadyExists = openMarkets.find(m => m.matchId === matchId);
-    if(alreadyExists){
-      console.log(`⏭  Skipping ${matchId} — market already open on chain`);
+    // Skip if already open
+    const openMarkets  = await getOpenMarketsFromChain();
+    const alreadyOpen  = openMarkets.find(m => m.matchId === matchId);
+    if(alreadyOpen){
+      console.log(`⏭  Skipping ${match.home} vs ${match.away} — already on chain`);
       return true;
     }
+
+    // Pick question
+    const questionFn = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
+    const question   = questionFn(match.home, match.away);
 
     console.log(`\n${match.flag} [${typeLabel}] ${match.comp}: ${match.home} vs ${match.away}`);
     console.log(`❓ "${question}"`);
@@ -183,151 +145,154 @@ async function createMarketForMatch(match, durationSeconds){
     if(receipt.status === 0){ console.error(`❌ TX reverted`); return false; }
     console.log(`✅ Market created! TX: ${receipt.hash.slice(0,20)}...`);
     return true;
-  } catch(e){ console.error(`❌ Failed:`, e.message); return false; }
-}
-
-// ─── FREE API 1: TheSportsDB (no key needed) ──────────────────────────────────
-async function fetchLiveMatchesSportsDB(){
-  try {
-    const res  = await fetch("https://www.thesportsdb.com/api/v1/json/3/eventslive.php");
-    const data = await res.json();
-    const events = data?.events || [];
-    console.log(`   TheSportsDB live events: ${events.length}`);
-
-    // Filter football/soccer only
-    const football = events.filter(e =>
-      e.strSport === "Soccer" || e.strSport === "Football"
-    );
-    console.log(`   Football events: ${football.length}`);
-
-    if(football.length > 0){
-      return football.map(e => ({
-        home: e.strHomeTeam,
-        away: e.strAwayTeam,
-        comp: e.strLeague || "Football",
-        flag: "⚽",
-        type: "live"
-      }));
+  } catch(e){
+    console.error(`❌ Failed to create market:`, e.message);
+    if(e.message.includes('insufficient funds')){
+      console.error(`💸 Out of OKB! Get testnet tokens: https://www.okx.com/xlayer/faucet`);
     }
-    return [];
-  } catch(e){ console.log("   TheSportsDB error:", e.message); return []; }
+    return false;
+  }
 }
 
-// ─── FREE API 2: TheSportsDB today's events ───────────────────────────────────
-async function fetchTodayMatchesSportsDB(){
-  try {
-    const today = new Date().toISOString().split("T")[0];
-    // Search for soccer events today across major leagues
-    const leagueIds = ["4328","4335","4331","4332","4334","4399","4480"]; // EPL, La Liga, Bundesliga, Serie A, Ligue1, CL, WC
-    let allMatches = [];
-
-    for(const lid of leagueIds){
-      try {
-        const res  = await fetch(`https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=${today}&l=${lid}`);
-        const data = await res.json();
-        const events = data?.events || [];
-        const live = events.filter(e =>
-          e.strStatus === "Match Finished" ||
-          e.strStatus === "In Progress" ||
-          e.strStatus === "HT" ||
-          e.intHomeScore !== null
-        );
-        if(live.length > 0){
-          allMatches = [...allMatches, ...live.map(e => ({
-            home: e.strHomeTeam,
-            away: e.strAwayTeam,
-            comp: e.strLeague || "Football",
-            flag: lid === "4399" ? "⭐" : lid === "4480" ? "🏆" : "⚽",
-            type: "live"
-          }))];
-        }
-        await sleep(500); // be polite to free API
-      } catch(e){}
-    }
-
-    console.log(`   TheSportsDB today matches: ${allMatches.length}`);
-    return allMatches;
-  } catch(e){ console.log("   TheSportsDB today error:", e.message); return []; }
-}
-
-// ─── FREE API 3: football-data.org (free key from env) ───────────────────────
+// ─── FREE API: football-data.org ──────────────────────────────────────────────
 async function fetchLiveMatchesFootballData(){
-  const key = process.env.FOOTBALL_API_KEY;
-  if(!key) return [];
+  if(!FOOTBALL_API_KEY){ console.log("   No FOOTBALL_API_KEY set"); return []; }
   try {
     const res = await fetch("https://api.football-data.org/v4/matches?status=IN_PLAY,PAUSED", {
-      headers:{"X-Auth-Token": key}
+      headers:{"X-Auth-Token": FOOTBALL_API_KEY}
     });
     if(!res.ok){ console.log("   football-data.org error:", res.status); return []; }
     const data    = await res.json();
     const matches = data.matches || [];
-    console.log(`   football-data.org live: ${matches.length}`);
+    console.log(`   football-data.org LIVE: ${matches.length} matches`);
     return matches.map(m => ({
       home: m.homeTeam.shortName || m.homeTeam.name,
       away: m.awayTeam.shortName || m.awayTeam.name,
       comp: m.competition.name,
-      flag: m.competition.code === "WC" ? "🏆" : m.competition.code === "CL" ? "⭐" : "⚽",
+      flag: getLeagueFlag(m.competition.code),
       type: "live"
     }));
   } catch(e){ console.log("   football-data.org error:", e.message); return []; }
 }
 
-// ─── NO DEMO MARKETS — real matches only ─────────────────────────────────────
-async function ensureDemoMarkets(){
-  console.log("   ⏸  No live matches right now — waiting for real matches...");
+async function fetchUpcomingMatchesFootballData(){
+  if(!FOOTBALL_API_KEY) return [];
+  try {
+    const today    = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(today.getDate() + 1);
+    const dateFrom = today.toISOString().split("T")[0];
+    const dateTo   = tomorrow.toISOString().split("T")[0];
+
+    const res = await fetch(`https://api.football-data.org/v4/matches?status=SCHEDULED&dateFrom=${dateFrom}&dateTo=${dateTo}`, {
+      headers:{"X-Auth-Token": FOOTBALL_API_KEY}
+    });
+    if(!res.ok) return [];
+    const data    = await res.json();
+    const matches = data.matches || [];
+    console.log(`   football-data.org UPCOMING (today+tomorrow): ${matches.length} matches`);
+    return matches.slice(0, 10).map(m => ({
+      home: m.homeTeam.shortName || m.homeTeam.name,
+      away: m.awayTeam.shortName || m.awayTeam.name,
+      comp: m.competition.name,
+      flag: getLeagueFlag(m.competition.code),
+      type: "upcoming",
+      kickoff: m.utcDate
+    }));
+  } catch(e){ console.log("   upcoming error:", e.message); return []; }
+}
+
+// ─── FREE API: TheSportsDB ────────────────────────────────────────────────────
+async function fetchLiveMatchesSportsDB(){
+  try {
+    // Try multiple free endpoints
+    const urls = [
+      "https://www.thesportsdb.com/api/v1/json/3/eventslive.php",
+      "https://www.thesportsdb.com/api/v1/json/3/latestsoccer.php",
+    ];
+    for(const url of urls){
+      try {
+        const res  = await fetch(url, { signal: AbortSignal.timeout(5000) });
+        if(!res.ok) continue;
+        const data = await res.json();
+        const events = (data.events || data.sports || []).filter(e =>
+          (e.strSport||'').toLowerCase().includes('soccer') ||
+          (e.strSport||'').toLowerCase().includes('football')
+        );
+        if(events.length > 0){
+          console.log(`   TheSportsDB live: ${events.length} matches`);
+          return events.map(e => ({
+            home: e.strHomeTeam,
+            away: e.strAwayTeam,
+            comp: e.strLeague || "Football",
+            flag: "⚽",
+            type: "live"
+          }));
+        }
+      } catch(e){}
+    }
+    return [];
+  } catch(e){ return []; }
+}
+
+function getLeagueFlag(code){
+  const flags = {PL:"🏴󠁧󠁢󠁥󠁮󠁧󠁿",PD:"🇪🇸",BL1:"🇩🇪",SA:"🇮🇹",FL1:"🇫🇷",CL:"⭐",EL:"🟠",WC:"🏆",EC:"🇪🇺",CLI:"🌎"};
+  return flags[code] || "⚽";
 }
 
 // ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 async function createMarkets(){
   console.log("\n🤖 Fetching live match data...");
 
-  // Try all free APIs in parallel
-  const [sportsDbLive, footballDataLive] = await Promise.all([
-    fetchLiveMatchesSportsDB(),
+  // Check balance first
+  const hasBalance = await checkWalletBalance();
+  if(!hasBalance) return;
+
+  // Fetch live matches from all sources in parallel
+  const [fdLive, sportsDbLive] = await Promise.all([
     fetchLiveMatchesFootballData(),
+    fetchLiveMatchesSportsDB(),
   ]);
 
   // Merge and deduplicate
-  let liveMatches = [...sportsDbLive];
-  for(const m of footballDataLive){
+  let liveMatches = [...fdLive];
+  for(const m of sportsDbLive){
     if(!liveMatches.find(x => makeMatchId(x.home,x.away) === makeMatchId(m.home,m.away))){
       liveMatches.push(m);
     }
   }
 
   if(liveMatches.length > 0){
-    console.log(`⚽ ${liveMatches.length} live matches found! Creating markets...`);
+    console.log(`⚽ ${liveMatches.length} LIVE matches — creating markets...`);
     for(const match of liveMatches){
-      await createMarketForMatch(match, 900); // 15 min markets for live matches
+      await createMarketForMatch(match, 900);
       await sleep(3000);
     }
-    return;
+  } else {
+    console.log("   No live matches right now.");
   }
 
-  // No live matches — try today's matches
-  console.log("   No live matches. Checking today's matches...");
-  const todayMatches = await fetchTodayMatchesSportsDB();
-  if(todayMatches.length > 0){
-    console.log(`🕐 ${todayMatches.length} today's matches — creating markets...`);
-    for(const match of todayMatches){
-      await createMarketForMatch(match, 3600);
+  // Always also fetch upcoming matches for next 24h
+  console.log("\n📅 Fetching upcoming fixtures...");
+  const upcoming = await fetchUpcomingMatchesFootballData();
+  if(upcoming.length > 0){
+    console.log(`📅 ${upcoming.length} upcoming matches — creating preview markets...`);
+    for(const match of upcoming){
+      await createMarketForMatch(match, 24 * 60 * 60); // 24h duration for upcoming
       await sleep(3000);
     }
-    return;
+  } else {
+    console.log("   No upcoming matches found.");
   }
-
-  // Fallback to demo markets
-  await ensureDemoMarkets();
 }
 
 // ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 async function run(){
-  console.log("🦁 ROAR AI Agent v9.0 starting...");
+  console.log("🦁 ROAR AI Agent v10.0 starting...");
   console.log(`📍 Contract: ${CONTRACT_ADDRESS}`);
-  console.log(`⛽  Gas: auto-estimated`);
   console.log(`⏱  Polling every 2 minutes`);
-  console.log(`📡 APIs: TheSportsDB (free) + football-data.org`);
-  console.log(`🎮 No demo markets — real live matches only\n`);
+  console.log(`📡 APIs: football-data.org + TheSportsDB (free)`);
+  console.log(`📅 Shows live matches + upcoming fixtures\n`);
 
   await settleExpiredMarkets();
   await createMarkets();
